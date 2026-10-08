@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Vluck Auto Player</string>
-    <string name="accessibility_desc">Controls the game by sending swipe gestures.</string>
+    <string name="accessibility_desc">Controls the game with automatic tap and swipe gestures.</string>
 </resources>

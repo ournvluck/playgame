@@ -6,6 +6,7 @@ import android.graphics.Path;
 import android.view.accessibility.AccessibilityEvent;
 
 public class GameAccessibilityService extends AccessibilityService {
+
     private static GameAccessibilityService instance;
 
     @Override
@@ -15,10 +16,12 @@ public class GameAccessibilityService extends AccessibilityService {
     }
 
     @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {}
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+    }
 
     @Override
-    public void onInterrupt() {}
+    public void onInterrupt() {
+    }
 
     @Override
     public void onDestroy() {
@@ -30,18 +33,51 @@ public class GameAccessibilityService extends AccessibilityService {
         return instance != null;
     }
 
-    public static void swipe(int startX, int startY, int endX, int endY, long durationMs) {
-        if (instance == null) return;
+    public static void tap(int x, int y) {
+        if (instance == null) {
+            return;
+        }
+
+        Path path = new Path();
+        path.moveTo(x, y);
+
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, 80);
+
+        GestureDescription gesture =
+                new GestureDescription.Builder()
+                        .addStroke(stroke)
+                        .build();
+
+        instance.dispatchGesture(gesture, null, null);
+    }
+
+    public static void swipe(
+            int startX,
+            int startY,
+            int endX,
+            int endY,
+            long durationMs) {
+
+        if (instance == null) {
+            return;
+        }
 
         Path path = new Path();
         path.moveTo(startX, startY);
         path.lineTo(endX, endY);
 
         GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(path, 0, durationMs);
+                new GestureDescription.StrokeDescription(
+                        path,
+                        0,
+                        durationMs
+                );
 
         GestureDescription gesture =
-                new GestureDescription.Builder().addStroke(stroke).build();
+                new GestureDescription.Builder()
+                        .addStroke(stroke)
+                        .build();
 
         instance.dispatchGesture(gesture, null, null);
     }
