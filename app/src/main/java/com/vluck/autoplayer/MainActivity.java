@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.media.projection.MediaProjectionManager;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.content.ComponentName;
 import android.widget.Button;
 import android.widget.TextView;
 
@@ -45,17 +46,37 @@ public class MainActivity extends Activity {
         super.onResume();
 
         if (CaptureService.isRunning()) {
-            status.setText("Status: RUNNING");
+            status.setText("Status: AUTO PLAYER RUNNING\nSwitch to the game now");
             return;
         }
 
-        if (GameAccessibilityService.isReady()) {
+        if (isAccessibilityEnabled()) {
             requestCapture();
         } else if (!accessibilitySettingsOpened) {
             accessibilitySettingsOpened = true;
             status.setText("Enable Accessibility, then return here...");
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
         }
+    }
+
+    private boolean isAccessibilityEnabled() {
+        String enabled = Settings.Secure.getString(
+                getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        );
+
+        if (enabled == null) return false;
+
+        ComponentName expected = new ComponentName(
+                this,
+                GameAccessibilityService.class
+        );
+
+        for (String item : enabled.split(":")) {
+            ComponentName cn = ComponentName.unflattenFromString(item);
+            if (expected.equals(cn)) return true;
+        }
+        return false;
     }
 
     private void requestCapture() {

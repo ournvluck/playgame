@@ -5,6 +5,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.pm.ServiceInfo;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.hardware.display.DisplayManager;
@@ -61,6 +62,9 @@ public class CaptureService extends Service {
     private int reversalCount = 0;
 
     private int stableBoardFrames = 0;
+    private long frameCount = 0;
+    private long actionCount = 0;
+    private long lastNotificationUpdate = 0;
 
     public static boolean isRunning() {
         return running;
@@ -72,7 +76,11 @@ public class CaptureService extends Service {
         running = true;
 
         createNotificationChannel();
-        startForeground(7, buildNotification());
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(7, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(7, buildNotification());
+        }
 
         thread = new HandlerThread("vluck-screen-analysis");
         thread.start();
@@ -129,6 +137,7 @@ public class CaptureService extends Service {
     }
 
     private void analyze(ImageReader reader) {
+        frameCount++;
         long now = System.currentTimeMillis();
 
         if (now - lastFrame < 75) {
@@ -290,6 +299,8 @@ public class CaptureService extends Service {
                         (int)(h * 0.77f)
                 );
                 lastOutcome = now;
+                actionCount++;
+                updateNotification();
                 resetControlMemory();
                 return true;
             }
@@ -302,6 +313,8 @@ public class CaptureService extends Service {
                         (int)(h * 0.79f)
                 );
                 lastOutcome = now;
+                actionCount++;
+                updateNotification();
                 resetControlMemory();
                 return true;
             }
@@ -352,12 +365,16 @@ public class CaptureService extends Service {
          */
         if (plan.bestTargetX < 0) return;
 
-        if (plan.dangerScore <= 0.01f) {
-            return;
-        }
-
         int center = b.getWidth() / 2;
         int delta = plan.bestTargetX - center;
+
+        // Even when the current centre is safe, move toward a deeper safe
+        // corridor if it is materially different.  The game keeps falling
+        // through successive platforms, so waiting on a currently-safe
+        // opening can still put the character onto yellow below.
+        if (Math.abs(delta) < b.getWidth() * 0.06f) {
+            return;
+        }
 
         /*
          * If a target is very close, do nothing.  The character has width and
@@ -400,6 +417,8 @@ public class CaptureService extends Service {
         );
 
         lastSteer = now;
+        actionCount++;
+        updateNotification();
         pendingSwipeSign = swipeDirection;
         pendingBeforeScore = plan.dangerScore;
         pendingSwipeAt = now;
@@ -410,13 +429,14 @@ public class CaptureService extends Service {
      * angle which does not intersect yellow on the upcoming platforms.
      */
     private PlayerAndPlan analyzePlan(Bitmap b) {
-        int playerY = findPlayerY(b);
-
-        if (playerY < 0) return null;
-
         int w = b.getWidth();
         int h = b.getHeight();
         int center = w / 2;
+
+        // The character stays close to the centre of the screen.  Do not make
+        // the whole controller depend on detecting the orange face: bubbles,
+        // animation and scaling can temporarily hide it.
+        int playerY = (int)(h * 0.30f);
 
         boolean[][] masks = buildMasks(b);
 
@@ -432,8 +452,8 @@ public class CaptureService extends Service {
          * Instead of reading one noisy scan line, average a vertical band.
          * This makes the platform detector stable against texture and bubbles.
          */
-        for (int y = Math.max(0, playerY + 55);
-             y < Math.min(h, (int)(h * 0.91f));
+        for (int y = Math.max(0, playerY + 70);
+             y < Math.min(h, (int)(h * 0.94f));
              y++) {
 
             int count = 0;
@@ -452,8 +472,8 @@ public class CaptureService extends Service {
 
         ArrayList<Integer> peaks = new ArrayList<>();
 
-        for (int y = playerY + 55;
-             y < Math.min(h * 0.91f, playerY + 1450);
+        for (int y = playerY + 70;
+             y < Math.min(h * 0.94f, playerY + (int)(h * 0.70f));
              y++) {
 
             if (rowStrength[y] < 0.16f) continue;
@@ -977,13 +997,23 @@ public class CaptureService extends Service {
         return Math.max(min, Math.min(max, v));
     }
 
+    private void updateNotification() {
+        long now = System.currentTimeMillis();
+        if (now - lastNotificationUpdate < 700) return;
+        lastNotificationUpdate = now;
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            nm.notify(7, buildNotification());
+        }
+    }
+
     private Notification buildNotification() {
         return new Notification.Builder(
                 this,
                 "autoplayer"
         )
                 .setContentTitle("Vluck Auto Player V4")
-                .setContentText("Auto play is running")
+                .setContentText("Frames: " + frameCount + " | Actions: " + actionCount)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setOngoing(true)
                 .build();

@@ -1,18 +1,22 @@
-# Vluck Auto Player V4
+# Vluck Auto Player V5
 
-Built around the supplied 78-second game recording.
+V5 fixes the V4 background-capture failure and improves the controller for the recorded game.
 
-V4 changes:
-- Loading screen is ignored; the controller waits for the real game board.
-- Uses the orange face to track the falling character vertically.
-- Detects teal safe platforms and yellow danger areas.
-- Looks at up to five upcoming platforms instead of only the next platform.
-- Chooses a horizontal angle that avoids yellow across the deepest safe route visible.
-- Uses small feedback-controlled horizontal drags and automatically reverses the drag direction if a move makes the danger worse.
-- Does not move when the current route is already safe.
-- Victory: automatically taps Continue.
-- Defeat: automatically taps Restart.
-- Auto-start setup when the app is opened.
-- STOP button remains available.
+## Important V5 fixes
+- Uses the required `mediaProjection` foreground-service type when starting the capture service on Android 10+.
+- Keeps the capture service alive while the game is in the foreground.
+- Shows frame/action counters in the persistent notification so you can verify that the analyzer is actually receiving frames.
+- Checks Android's enabled Accessibility-services list instead of relying only on an in-process service instance.
+- Does not require orange-face detection before looking for platforms; the player can be temporarily hidden by animation/bubbles without stopping the controller.
+- Looks farther down the tower and can steer even when the current centre is safe, because a lower yellow sector may be the real danger.
+- Loading screen is ignored until teal/yellow game-board pixels appear.
+- Victory -> Continue; Defeat -> Restart.
 
-Android still requires the user to approve Accessibility and screen-capture permissions. Android may show "Restricted setting" for a sideloaded Accessibility service; this is an Android security restriction and cannot be bypassed by the APK.
+## First run
+1. Enable Vluck Auto Player under Android Accessibility.
+2. Open Vluck Auto Player.
+3. Approve Android screen capture.
+4. Check the notification. It should show `Frames: ... | Actions: ...` and the frame count should increase while the game is visible.
+5. Switch to the game.
+
+Android requires explicit user approval for MediaProjection screen capture and Accessibility gestures. The app cannot silently grant those permissions.
