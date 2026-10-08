@@ -7,7 +7,6 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.Color;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -19,6 +18,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
+import android.graphics.Color;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,14 +26,14 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * V3 game controller.
+ * V4 controller for the Helix-style game shown in the supplied recording.
  *
- * Game model used here:
- * - The character stays close to the screen center.
- * - The tower/platforms rotate horizontally.
- * - The character automatically jumps/falls.
- * - The safe route is a GAP, not a platform surface and never the yellow area.
- * - During loading, the controller does nothing and waits for the board.
+ * Main change from V3:
+ * The controller does not only inspect the next platform.  It looks several
+ * platforms downward and chooses a horizontal angle that avoids YELLOW on
+ * as many upcoming platforms as possible.  Teal is safe; empty space is
+ * also safe.  This is important because the ball can pass one safe opening
+ * and then hit yellow on the following platform.
  */
 public class CaptureService extends Service {
 
@@ -42,29 +42,23 @@ public class CaptureService extends Service {
 
     private static volatile boolean running = false;
 
-    /*
-     * If the first test shows that a swipe moves the gap in the opposite
-     * direction, the controller automatically learns the direction after
-     * observing the next frame. This is only the initial guess.
-     */
-    private int controlSign = 1;
-
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
     private HandlerThread thread;
     private Handler handler;
 
-    private long lastFrame = 0;
-    private long lastSteerAction = 0;
-    private long lastOutcomeAction = 0;
-    private long lastBoardSeen = 0;
+    private long lastFrame;
+    private long lastSteer;
+    private long lastOutcome;
 
-    private float previousTargetX = -1;
-    private float previousGapWidth = -1;
-    private float previousCenterDistance = -1;
-    private int previousSteerDirection = 0;
-    private long previousSteerTime = 0;
+    /* Initial guess; V4 learns the actual drag direction from screen feedback. */
+    private int controlSign = 1;
+
+    private int pendingSwipeSign = 0;
+    private float pendingBeforeScore = Float.NaN;
+    private long pendingSwipeAt = 0;
+    private int reversalCount = 0;
 
     private int stableBoardFrames = 0;
 
@@ -87,9 +81,7 @@ public class CaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) {
-            return START_STICKY;
-        }
+        if (intent == null) return START_STICKY;
 
         Intent data = intent.getParcelableExtra(EXTRA_DATA);
         int resultCode = intent.getIntExtra(
@@ -108,7 +100,6 @@ public class CaptureService extends Service {
             DisplayMetrics dm = getResources().getDisplayMetrics();
             int width = dm.widthPixels;
             int height = dm.heightPixels;
-            int density = dm.densityDpi;
 
             imageReader = ImageReader.newInstance(
                     width,
@@ -126,7 +117,7 @@ public class CaptureService extends Service {
                     "VluckAutoPlayer",
                     width,
                     height,
-                    density,
+                    dm.densityDpi,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(),
                     null,
@@ -140,7 +131,7 @@ public class CaptureService extends Service {
     private void analyze(ImageReader reader) {
         long now = System.currentTimeMillis();
 
-        if (now - lastFrame < 90) {
+        if (now - lastFrame < 75) {
             return;
         }
         lastFrame = now;
@@ -150,11 +141,10 @@ public class CaptureService extends Service {
 
         try {
             image = reader.acquireLatestImage();
-            if (image == null) {
-                return;
-            }
+            if (image == null) return;
 
             Image.Plane plane = image.getPlanes()[0];
+
             int width = image.getWidth();
             int height = image.getHeight();
             int pixelStride = plane.getPixelStride();
@@ -166,111 +156,105 @@ public class CaptureService extends Service {
                     height,
                     Bitmap.Config.ARGB_8888
             );
+
             bitmap.copyPixelsFromBuffer(plane.getBuffer());
 
-            /*
-             * Loading screen / blank / transition:
-             * do absolutely nothing and wait for a real game board.
-             */
             if (!hasGameBoard(bitmap)) {
                 stableBoardFrames = 0;
+                resetControlMemory();
                 return;
             }
 
-            lastBoardSeen = now;
             stableBoardFrames++;
 
-            /* Don't steer on the first frame after loading. */
-            if (stableBoardFrames < 3) {
-                return;
-            }
+            /* Give the game a few frames after Loading... disappears. */
+            if (stableBoardFrames < 3) return;
 
-            /* Victory/defeat is checked before normal steering. */
             if (handleOutcome(bitmap)) {
                 return;
             }
 
-            steerToNextSafeGap(bitmap);
+            controlGame(bitmap);
 
         } catch (Throwable ignored) {
-            // Keep the service alive if one captured frame is malformed.
+            // Never kill the capture service because one frame is malformed.
         } finally {
             if (bitmap != null && !bitmap.isRecycled()) {
                 bitmap.recycle();
             }
-            if (image != null) {
-                image.close();
-            }
+            if (image != null) image.close();
         }
     }
 
-    /**
-     * The supplied loading screenshot is mostly black with a white loading
-     * indicator and contains no teal game platforms. We therefore use the
-     * presence of real teal platform pixels as the board-ready signal.
-     */
-    private boolean hasGameBoard(Bitmap bitmap) {
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
+    private boolean hasGameBoard(Bitmap b) {
+        int w = b.getWidth();
+        int h = b.getHeight();
 
-        int x0 = (int) (w * 0.05f);
-        int x1 = (int) (w * 0.95f);
-        int y0 = (int) (h * 0.25f);
-        int y1 = (int) (h * 0.90f);
+        int x0 = (int)(w * 0.05f);
+        int x1 = (int)(w * 0.95f);
+        int y0 = (int)(h * 0.20f);
+        int y1 = (int)(h * 0.92f);
 
         int teal = 0;
+        int yellow = 0;
         int samples = 0;
 
-        int stepX = Math.max(3, w / 180);
-        int stepY = Math.max(3, h / 320);
+        int sx = Math.max(4, w / 180);
+        int sy = Math.max(4, h / 300);
 
-        for (int y = y0; y < y1; y += stepY) {
-            for (int x = x0; x < x1; x += stepX) {
-                int c = bitmap.getPixel(x, y);
+        for (int y = y0; y < y1; y += sy) {
+            for (int x = x0; x < x1; x += sx) {
+                int c = b.getPixel(x, y);
                 int[] hsv = rgbToHsv(
                         Color.red(c),
                         Color.green(c),
                         Color.blue(c)
                 );
-                if (isTealPlatform(hsv[0], hsv[1], hsv[2])) {
-                    teal++;
-                }
+
+                if (isTeal(hsv[0], hsv[1], hsv[2])) teal++;
+                if (isYellow(hsv[0], hsv[1], hsv[2])) yellow++;
                 samples++;
             }
         }
 
-        /* Around 0.25% of samples is enough to reject the black loading page. */
-        return samples > 0 && teal > Math.max(80, samples / 380);
+        /*
+         * Loading is black and has neither the teal platform texture nor the
+         * yellow hazard.  Either color is enough to consider the board live.
+         */
+        return samples > 0 &&
+                (teal + yellow) > Math.max(100, samples / 300);
     }
 
-    /**
-     * Outcome detection is based on the actual Continue/Restart button
-     * colours, not generic purple/blue pixels. This avoids treating normal
-     * game graphics as a result screen.
-     */
-    private boolean handleOutcome(Bitmap bitmap) {
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
+    private boolean handleOutcome(Bitmap b) {
+        int w = b.getWidth();
+        int h = b.getHeight();
 
+        /*
+         * Both Continue and Restart are the large centre button shown in the
+         * recording.  Continue is blue; Restart is lavender/purple.
+         */
         int cx = w / 2;
-        int cy = (int) (h * 0.77f);
+        int cy = (int)(h * 0.78f);
 
-        int radiusX = (int) (w * 0.20f);
-        int radiusY = (int) (h * 0.075f);
+        int rx = (int)(w * 0.19f);
+        int ry = (int)(h * 0.085f);
 
-        int blueButton = 0;
-        int purpleButton = 0;
+        int blue = 0;
+        int purple = 0;
         int samples = 0;
 
-        for (int y = Math.max(0, cy - radiusY);
-             y < Math.min(h, cy + radiusY);
-             y += Math.max(2, h / 600)) {
+        int stepX = Math.max(4, w / 220);
+        int stepY = Math.max(4, h / 360);
 
-            for (int x = Math.max(0, cx - radiusX);
-                 x < Math.min(w, cx + radiusX);
-                 x += Math.max(2, w / 260)) {
+        for (int y = Math.max(0, cy - ry);
+             y < Math.min(h, cy + ry);
+             y += stepY) {
 
-                int c = bitmap.getPixel(x, y);
+            for (int x = Math.max(0, cx - rx);
+                 x < Math.min(w, cx + rx);
+                 x += stepX) {
+
+                int c = b.getPixel(x, y);
                 int[] hsv = rgbToHsv(
                         Color.red(c),
                         Color.green(c),
@@ -281,52 +265,44 @@ public class CaptureService extends Service {
                 int sat = hsv[1];
                 int val = hsv[2];
 
-                if (sat > 55 && val > 100) {
-                    /* Continue button: light blue / blue */
-                    if (hue >= 90 && hue <= 123) {
-                        blueButton++;
-                    }
-                    /* Restart button: lavender / purple */
-                    if (hue >= 124 && hue <= 170) {
-                        purpleButton++;
-                    }
+                if (sat > 45 && val > 100) {
+                    if (hue >= 85 && hue <= 125) blue++;
+                    if (hue >= 125 && hue <= 175) purple++;
                 }
+
                 samples++;
             }
         }
 
         long now = System.currentTimeMillis();
-        if (now - lastOutcomeAction < 1400) {
-            return blueButton > samples * 0.02f ||
-                    purpleButton > samples * 0.02f;
+
+        if (now - lastOutcome < 1400) {
+            return blue > samples * 0.02f ||
+                    purple > samples * 0.02f;
         }
 
-        int threshold = Math.max(80, (int) (samples * 0.035f));
+        int threshold = Math.max(70, (int)(samples * 0.025f));
 
-        if (blueButton > threshold &&
-                blueButton > purpleButton * 1.20f) {
-
+        if (blue > threshold && blue > purple * 1.15f) {
             if (GameAccessibilityService.isReady()) {
                 GameAccessibilityService.tap(
                         cx,
-                        (int) (h * 0.76f)
+                        (int)(h * 0.77f)
                 );
-                lastOutcomeAction = now;
-                resetSteeringMemory();
+                lastOutcome = now;
+                resetControlMemory();
                 return true;
             }
         }
 
-        if (purpleButton > threshold &&
-                purpleButton > blueButton * 1.20f) {
-
+        if (purple > threshold && purple > blue * 1.15f) {
             if (GameAccessibilityService.isReady()) {
                 GameAccessibilityService.tap(
                         cx,
-                        (int) (h * 0.79f)
+                        (int)(h * 0.79f)
                 );
-                lastOutcomeAction = now;
-                resetSteeringMemory();
+                lastOutcome = now;
+                resetControlMemory();
                 return true;
             }
         }
@@ -334,433 +310,627 @@ public class CaptureService extends Service {
         return false;
     }
 
-    /**
-     * Core game logic.
-     *
-     * Instead of asking "where is the player?", this version assumes the
-     * character is the fixed reference point in the centre. We locate the
-     * FIRST real platform below the character, identify all safe gaps in that
-     * platform, and rotate the tower until a safe gap is centred.
-     */
-    private void steerToNextSafeGap(Bitmap bitmap) {
-        if (!GameAccessibilityService.isReady()) {
-            return;
-        }
+    private void controlGame(Bitmap b) {
+        if (!GameAccessibilityService.isReady()) return;
 
         long now = System.currentTimeMillis();
-
-        if (now - lastSteerAction < 280) {
-            learnFromPreviousSteer(bitmap);
-            return;
-        }
-
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
-        int centerX = w / 2;
-
-        int playerY = estimatePlayerY(bitmap);
-        if (playerY < 0) {
-            /* The board is visible but the character is not confidently found. */
-            playerY = (int) (h * 0.30f);
-        }
-
-        PlatformLine platform = findNextPlatform(bitmap, playerY);
-        if (platform == null) {
-            return;
-        }
-
-        List<Gap> safeGaps = findSafeGaps(bitmap, platform.y, centerX);
-        if (safeGaps.isEmpty()) {
-            return;
-        }
-
-        Gap best = chooseBestGap(safeGaps, centerX);
-        if (best == null) {
-            return;
-        }
-
-        float centerDistance = Math.abs(best.center - centerX);
 
         /*
-         * If the centre already lies inside a wide safe gap, do NOT move.
-         * This is the critical rule: never rotate off a safe opening just
-         * because a different opening looks attractive.
+         * Learn the drag direction after every real gesture.  We compare the
+         * danger score before/after the gesture.  If it became worse, reverse
+         * the control direction automatically.
          */
-        if (best.start <= centerX && best.end >= centerX &&
-                best.width >= w * 0.09f) {
-            previousTargetX = best.center;
-            previousGapWidth = best.width;
-            previousCenterDistance = centerDistance;
+        if (pendingSwipeSign != 0 &&
+                now - pendingSwipeAt >= 220 &&
+                now - pendingSwipeAt <= 900) {
+
+            PlayerAndPlan plan = analyzePlan(b);
+
+            if (plan != null && !Float.isNaN(pendingBeforeScore)) {
+                if (plan.dangerScore > pendingBeforeScore + 0.15f) {
+                    controlSign *= -1;
+                    reversalCount++;
+                }
+
+                pendingSwipeSign = 0;
+
+                if (reversalCount >= 2) {
+                    reversalCount = 0;
+                }
+            }
+        }
+
+        if (now - lastSteer < 185) return;
+
+        PlayerAndPlan plan = analyzePlan(b);
+        if (plan == null) return;
+
+        /*
+         * dangerScore is 0 when the current centre angle is safe across the
+         * visible upcoming platforms.  A non-zero score means yellow is in
+         * the landing corridor on one or more upcoming floors.
+         */
+        if (plan.bestTargetX < 0) return;
+
+        if (plan.dangerScore <= 0.01f) {
             return;
         }
 
-        /* If there is a safe gap close enough to centre, make only a tiny move. */
-        float deadZone = w * 0.035f;
-        if (centerDistance <= deadZone) {
+        int center = b.getWidth() / 2;
+        int delta = plan.bestTargetX - center;
+
+        /*
+         * If a target is very close, do nothing.  The character has width and
+         * the tower can continue rotating slightly between frames.
+         */
+        if (Math.abs(delta) < b.getWidth() * 0.045f) {
             return;
         }
 
-        int direction = best.center > centerX ? 1 : -1;
+        int direction = delta > 0 ? 1 : -1;
 
-        /* Learn whether screen motion follows or opposes our initial sign. */
+        /*
+         * The feature at bestTargetX must move toward screen centre.
+         * controlSign converts desired screen movement to the game's drag
+         * convention.
+         */
         int swipeDirection = direction * controlSign;
 
-        int distance = (int) Math.min(
-                w * 0.20f,
-                Math.max(w * 0.075f, centerDistance * 0.65f)
+        int distance = (int)Math.min(
+                b.getWidth() * 0.24f,
+                Math.max(
+                        b.getWidth() * 0.07f,
+                        Math.abs(delta) * 0.58f
+                )
         );
 
-        int startX = centerX;
-        int endX = centerX + swipeDirection * distance;
+        int startX = center;
+        int endX = clamp(
+                center + swipeDirection * distance,
+                50,
+                b.getWidth() - 50
+        );
 
-        endX = clamp(endX, 40, w - 40);
-
-        /* Horizontal drag is the game's tower rotation control. */
         GameAccessibilityService.swipe(
                 startX,
-                (int) (h * 0.48f),
+                (int)(b.getHeight() * 0.50f),
                 endX,
-                (int) (h * 0.48f),
-                115
+                (int)(b.getHeight() * 0.50f),
+                105
         );
 
-        lastSteerAction = now;
-        previousTargetX = best.center;
-        previousGapWidth = best.width;
-        previousCenterDistance = centerDistance;
-        previousSteerDirection = direction;
-        previousSteerTime = now;
+        lastSteer = now;
+        pendingSwipeSign = swipeDirection;
+        pendingBeforeScore = plan.dangerScore;
+        pendingSwipeAt = now;
     }
 
     /**
-     * After a steering gesture, look for the same/nearest gap. If it moved in
-     * the wrong direction, invert the control sign. This compensates for the
-     * game's drag convention without requiring the user to configure it.
+     * Look several platforms below the character and choose a horizontal
+     * angle which does not intersect yellow on the upcoming platforms.
      */
-    private void learnFromPreviousSteer(Bitmap bitmap) {
-        if (previousTargetX < 0 || previousSteerDirection == 0) {
-            return;
-        }
+    private PlayerAndPlan analyzePlan(Bitmap b) {
+        int playerY = findPlayerY(b);
 
-        long now = System.currentTimeMillis();
-        if (now - previousSteerTime < 260 ||
-                now - previousSteerTime > 850) {
-            return;
-        }
+        if (playerY < 0) return null;
 
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
-        int centerX = w / 2;
+        int w = b.getWidth();
+        int h = b.getHeight();
+        int center = w / 2;
 
-        PlatformLine platform = findNextPlatform(
-                bitmap,
-                (int) (h * 0.28f)
-        );
+        boolean[][] masks = buildMasks(b);
 
-        if (platform == null) {
-            return;
-        }
+        boolean[] platformMask = masks[0];
+        boolean[] yellowMask = masks[1];
 
-        List<Gap> gaps = findSafeGaps(
-                bitmap,
-                platform.y,
-                centerX
-        );
+        float[] rowStrength = new float[h];
 
-        Gap nearest = nearestGap(gaps, previousTargetX);
-        if (nearest == null) {
-            return;
-        }
+        int x0 = (int)(w * 0.055f);
+        int x1 = (int)(w * 0.945f);
 
-        float movement = nearest.center - previousTargetX;
+        /*
+         * Instead of reading one noisy scan line, average a vertical band.
+         * This makes the platform detector stable against texture and bubbles.
+         */
+        for (int y = Math.max(0, playerY + 55);
+             y < Math.min(h, (int)(h * 0.91f));
+             y++) {
 
-        /* The desired gap was supposed to move toward the centre. */
-        boolean wantedLeft = previousTargetX < centerX;
-        boolean movedLeft = movement < -w * 0.01f;
-        boolean movedRight = movement > w * 0.01f;
+            int count = 0;
 
-        boolean movedTowardCenter =
-                (wantedLeft && movedRight) ||
-                (!wantedLeft && movedLeft);
-
-        if ((movedLeft || movedRight) && !movedTowardCenter) {
-            controlSign *= -1;
-        }
-
-        previousSteerDirection = 0;
-    }
-
-    /** Find the first strong platform band below the character. */
-    private PlatformLine findNextPlatform(Bitmap bitmap, int playerY) {
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
-
-        int start = clamp(
-                playerY + Math.max(35, h / 50),
-                0,
-                h - 1
-        );
-        int end = (int) (h * 0.92f);
-
-        int minOccupied = Math.max(10, (int) (w * 0.12f));
-
-        /* Search from top to bottom: first strong band is the next platform. */
-        for (int y = start; y < end; y += Math.max(4, h / 300)) {
-            int occupied = countPlatformPixels(bitmap, y);
-
-            if (occupied < minOccupied) {
-                continue;
+            for (int x = x0; x < x1; x += Math.max(3, w / 360)) {
+                if (platformMask[y * w + x]) count++;
             }
 
-            int bestY = y;
-            int bestCount = occupied;
+            rowStrength[y] =
+                    count /
+                    (float)Math.max(
+                            1,
+                            (x1 - x0) / Math.max(3, w / 360)
+                    );
+        }
 
-            int window = Math.max(8, h / 100);
-            for (int yy = y + 4;
-                 yy <= Math.min(end, y + window);
-                 yy += 4) {
+        ArrayList<Integer> peaks = new ArrayList<>();
 
-                int count = countPlatformPixels(bitmap, yy);
-                if (count > bestCount) {
-                    bestCount = count;
-                    bestY = yy;
+        for (int y = playerY + 55;
+             y < Math.min(h * 0.91f, playerY + 1450);
+             y++) {
+
+            if (rowStrength[y] < 0.16f) continue;
+
+            boolean localMax = true;
+
+            for (int d = 1; d <= 12; d++) {
+                int ya = y - d;
+                int yb = y + d;
+
+                if (ya >= 0 && rowStrength[ya] > rowStrength[y]) {
+                    localMax = false;
+                    break;
+                }
+
+                if (yb < h && rowStrength[yb] > rowStrength[y]) {
+                    localMax = false;
+                    break;
                 }
             }
 
-            if (bestCount >= minOccupied) {
-                return new PlatformLine(bestY, bestCount);
-            }
-        }
+            if (!localMax) continue;
 
-        return null;
-    }
-
-    private int countPlatformPixels(Bitmap bitmap, int y) {
-        int w = bitmap.getWidth();
-        int x0 = (int) (w * 0.06f);
-        int x1 = (int) (w * 0.94f);
-        int count = 0;
-
-        int step = Math.max(2, w / 360);
-        for (int x = x0; x < x1; x += step) {
-            int c = bitmap.getPixel(x, y);
-            int[] hsv = rgbToHsv(
-                    Color.red(c),
-                    Color.green(c),
-                    Color.blue(c)
-            );
-            if (isTealPlatform(hsv[0], hsv[1], hsv[2]) ||
-                    isYellowDanger(hsv[0], hsv[1], hsv[2])) {
-                count += step;
-            }
-        }
-        return count;
-    }
-
-    /**
-     * Convert one horizontal platform line into safe gaps.
-     * Teal and yellow are both treated as occupied. Only non-platform space
-     * between real platform runs is a candidate gap.
-     */
-    private List<Gap> findSafeGaps(
-            Bitmap bitmap,
-            int y,
-            int centerX) {
-
-        int w = bitmap.getWidth();
-        int minX = (int) (w * 0.06f);
-        int maxX = (int) (w * 0.94f);
-        int step = Math.max(2, w / 420);
-
-        ArrayList<Run> runs = new ArrayList<>();
-        boolean inRun = false;
-        int runStart = 0;
-
-        for (int x = minX; x <= maxX; x += step) {
-            boolean occupied = isPlatformPixel(bitmap, x, y);
-
-            if (occupied && !inRun) {
-                inRun = true;
-                runStart = x;
-            }
-
-            if ((!occupied || x + step > maxX) && inRun) {
-                int runEnd = occupied ? x : x - step;
-                if (runEnd - runStart >= Math.max(8, w / 90)) {
-                    runs.add(new Run(runStart, runEnd));
+            if (peaks.isEmpty() ||
+                    y - peaks.get(peaks.size() - 1) > 100) {
+                peaks.add(y);
+            } else {
+                int last = peaks.size() - 1;
+                if (rowStrength[y] > rowStrength[peaks.get(last)]) {
+                    peaks.set(last, y);
                 }
-                inRun = false;
             }
         }
 
-        ArrayList<Gap> gaps = new ArrayList<>();
+        if (peaks.isEmpty()) return null;
 
-        for (int i = 0; i + 1 < runs.size(); i++) {
-            int start = runs.get(i).end + 1;
-            int end = runs.get(i + 1).start - 1;
-            int width = end - start + 1;
+        /*
+         * Merge multiple local peaks belonging to the same thick platform.
+         */
+        ArrayList<Integer> bands = new ArrayList<>();
 
-            if (width < w * 0.035f || width > w * 0.55f) {
-                continue;
-            }
-
-            /* Extra clearance for the character: do not skim an edge. */
-            int clearance = Math.max(10, (int) (w * 0.025f));
-            int safeStart = start + clearance;
-            int safeEnd = end - clearance;
-            int safeWidth = safeEnd - safeStart + 1;
-
-            if (safeWidth < w * 0.025f) {
-                continue;
-            }
-
-            gaps.add(new Gap(
-                    safeStart,
-                    safeEnd,
-                    safeWidth,
-                    (safeStart + safeEnd) / 2
-            ));
-        }
-
-        /* Include edge gaps only if they are large enough. */
-        if (!runs.isEmpty()) {
-            Run first = runs.get(0);
-            if (first.start - minX >= w * 0.08f) {
-                gaps.add(new Gap(
-                        minX,
-                        first.start - 1,
-                        first.start - minX,
-                        (minX + first.start - 1) / 2
-                ));
-            }
-
-            Run last = runs.get(runs.size() - 1);
-            if (maxX - last.end >= w * 0.08f) {
-                gaps.add(new Gap(
-                        last.end + 1,
-                        maxX,
-                        maxX - last.end,
-                        (last.end + 1 + maxX) / 2
-                ));
+        for (int p : peaks) {
+            if (bands.isEmpty() ||
+                    p - bands.get(bands.size() - 1) > 175) {
+                bands.add(p);
+            } else {
+                int last = bands.size() - 1;
+                if (rowStrength[p] > rowStrength[bands.get(last)]) {
+                    bands.set(last, p);
+                }
             }
         }
 
-        return gaps;
-    }
+        if (bands.isEmpty()) return null;
 
-    private boolean isPlatformPixel(Bitmap bitmap, int x, int y) {
-        int c = bitmap.getPixel(
-                clamp(x, 0, bitmap.getWidth() - 1),
-                clamp(y, 0, bitmap.getHeight() - 1)
+        /*
+         * Only the next few platforms matter.  More distant floors are
+         * intentionally ignored because the tower can change before then.
+         */
+        int platformCount = Math.min(5, bands.size());
+
+        ArrayList<Interval> yellowIntervals =
+                new ArrayList<>();
+
+        ArrayList<ArrayList<Interval>> perPlatform =
+                new ArrayList<>();
+
+        for (int i = 0; i < platformCount; i++) {
+
+            int y = bands.get(i);
+
+            ArrayList<Interval> intervals =
+                    getYellowIntervals(
+                            yellowMask,
+                            w,
+                            h,
+                            y
+                    );
+
+            perPlatform.add(intervals);
+        }
+
+        /*
+         * Try many possible horizontal angles.  A point is unsafe when the
+         * character-sized corridor around it overlaps yellow.
+         */
+        int halfCharacter =
+                Math.max(28, (int)(w * 0.038f));
+
+        ArrayList<Integer> candidates =
+                new ArrayList<>();
+
+        for (int x = 70; x <= w - 70; x += Math.max(8, w / 90)) {
+            candidates.add(x);
+        }
+
+        for (ArrayList<Interval> intervals : perPlatform) {
+            for (Interval in : intervals) {
+                candidates.add(
+                        clamp(
+                                in.start - halfCharacter - 10,
+                                70,
+                                w - 70
+                        )
+                );
+
+                candidates.add(
+                        clamp(
+                                in.end + halfCharacter + 10,
+                                70,
+                                w - 70
+                        )
+                );
+            }
+        }
+
+        int bestX = -1;
+        float bestScore = Float.MAX_VALUE;
+        float currentScore = dangerAt(
+                center,
+                perPlatform,
+                halfCharacter,
+                platformCount
         );
 
-        int[] hsv = rgbToHsv(
-                Color.red(c),
-                Color.green(c),
-                Color.blue(c)
-        );
+        for (int x : candidates) {
 
-        return isTealPlatform(hsv[0], hsv[1], hsv[2]) ||
-                isYellowDanger(hsv[0], hsv[1], hsv[2]);
-    }
+            float danger =
+                    dangerAt(
+                            x,
+                            perPlatform,
+                            halfCharacter,
+                            platformCount
+                    );
 
-    private Gap chooseBestGap(List<Gap> gaps, int centerX) {
-        if (gaps.isEmpty()) {
-            return null;
-        }
+            /*
+             * Earlier platforms get higher weight because they will be hit
+             * first.  Still reward a target that is safe deeper down.
+             */
+            float weighted = danger;
 
-        Gap best = null;
-        float bestScore = -Float.MAX_VALUE;
+            if (danger == 0) {
+                weighted = 0;
+            }
 
-        for (Gap g : gaps) {
-            boolean containsCenter =
-                    g.start <= centerX && g.end >= centerX;
+            float distancePenalty =
+                    Math.abs(x - center) /
+                    (float)w;
 
-            float distance = Math.abs(g.center - centerX);
-            float widthBonus = Math.min(g.width, 0.25f * 10000f);
-
+            /*
+             * If two targets have identical safety, stay close to centre.
+             * But safety dominates strongly.
+             */
             float score =
-                    (containsCenter ? 100000f : 0f) +
-                    widthBonus * 2f -
-                    distance * 1.7f;
+                    weighted * 1000f +
+                    distancePenalty;
 
-            if (score > bestScore) {
+            if (score < bestScore) {
                 bestScore = score;
-                best = g;
+                bestX = x;
             }
         }
 
-        return best;
+        if (bestX < 0) return null;
+
+        return new PlayerAndPlan(
+                playerY,
+                bestX,
+                currentScore
+        );
     }
 
-    private Gap nearestGap(List<Gap> gaps, float x) {
-        Gap best = null;
-        float distance = Float.MAX_VALUE;
+    /**
+     * danger is the number of upcoming platforms whose yellow interval
+     * intersects the character corridor.
+     */
+    private float dangerAt(
+            int x,
+            ArrayList<ArrayList<Interval>> perPlatform,
+            int halfCharacter,
+            int count) {
 
-        for (Gap g : gaps) {
-            float d = Math.abs(g.center - x);
-            if (d < distance) {
-                distance = d;
-                best = g;
+        float score = 0;
+
+        for (int i = 0; i < count; i++) {
+
+            ArrayList<Interval> intervals =
+                    perPlatform.get(i);
+
+            boolean hit = false;
+
+            for (Interval in : intervals) {
+                if (x + halfCharacter >= in.start &&
+                        x - halfCharacter <= in.end) {
+                    hit = true;
+                    break;
+                }
+            }
+
+            if (hit) {
+                /*
+                 * The first platform is most urgent.
+                 */
+                score +=
+                        (count - i) /
+                        (float)count;
             }
         }
-        return best;
+
+        return score;
     }
 
-    /** Blue spikes/character are more reliable than the orange face. */
-    private int estimatePlayerY(Bitmap bitmap) {
-        int w = bitmap.getWidth();
-        int h = bitmap.getHeight();
+    private ArrayList<Interval> getYellowIntervals(
+            boolean[] yellow,
+            int w,
+            int h,
+            int centerY) {
 
-        int x0 = (int) (w * 0.30f);
-        int x1 = (int) (w * 0.70f);
-        int y0 = (int) (h * 0.12f);
-        int y1 = (int) (h * 0.50f);
+        int halfBand = 55;
+        int x0 = (int)(w * 0.055f);
+        int x1 = (int)(w * 0.945f);
 
-        long sumY = 0;
-        long count = 0;
+        float[] score = new float[x1 - x0];
 
-        int step = Math.max(2, w / 360);
+        for (int x = x0; x < x1; x++) {
 
-        for (int y = y0; y < y1; y += step) {
-            for (int x = x0; x < x1; x += step) {
-                int c = bitmap.getPixel(x, y);
+            int count = 0;
+            int total = 0;
+
+            for (int y = Math.max(0, centerY - halfBand);
+                 y <= Math.min(h - 1, centerY + halfBand);
+                 y += 4) {
+
+                total++;
+
+                if (yellow[y * w + x]) {
+                    count++;
+                }
+            }
+
+            score[x - x0] =
+                    count / (float)Math.max(1, total);
+        }
+
+        /*
+         * Yellow sectors are wide.  A little horizontal smoothing makes the
+         * result insensitive to texture, bubbles and anti-aliasing.
+         */
+        float[] smooth = new float[score.length];
+
+        int radius = Math.max(4, w / 220);
+
+        for (int i = 0; i < score.length; i++) {
+            int a = Math.max(0, i - radius);
+            int z = Math.min(score.length - 1, i + radius);
+
+            float sum = 0;
+            for (int j = a; j <= z; j++) sum += score[j];
+
+            smooth[i] = sum / (z - a + 1);
+        }
+
+        ArrayList<Interval> result = new ArrayList<>();
+
+        boolean inside = false;
+        int start = 0;
+
+        for (int i = 0; i < smooth.length; i++) {
+
+            boolean yes = smooth[i] >= 0.16f;
+
+            if (yes && !inside) {
+                inside = true;
+                start = i;
+            }
+
+            if ((!yes || i == smooth.length - 1) && inside) {
+
+                int end =
+                        (yes && i == smooth.length - 1)
+                                ? i
+                                : i - 1;
+
+                int sx = start + x0;
+                int ex = end + x0;
+
+                if (ex - sx >= w * 0.035f) {
+                    result.add(new Interval(sx, ex));
+                }
+
+                inside = false;
+            }
+        }
+
+        return result;
+    }
+
+    private int findPlayerY(Bitmap b) {
+        int w = b.getWidth();
+        int h = b.getHeight();
+
+        /*
+         * The recording clearly shows an orange face under a blue spiked
+         * shell.  Orange is much less confused with the teal platforms than
+         * blue, so use the face for vertical tracking.
+         */
+        int x0 = (int)(w * 0.34f);
+        int x1 = (int)(w * 0.66f);
+        int y0 = (int)(h * 0.10f);
+        int y1 = (int)(h * 0.58f);
+
+        boolean[] mask = new boolean[w * h];
+
+        for (int y = y0; y < y1; y += 2) {
+            for (int x = x0; x < x1; x += 2) {
+
+                int c = b.getPixel(x, y);
+
                 int[] hsv = rgbToHsv(
                         Color.red(c),
                         Color.green(c),
                         Color.blue(c)
                 );
 
-                /* Strong blue, but not the teal platform hue. */
-                if (hsv[0] >= 105 && hsv[0] <= 145 &&
-                        hsv[1] >= 110 && hsv[2] >= 45) {
-                    count++;
-                    sumY += y;
+                /*
+                 * Orange face:
+                 * hue 5..22 in Android/OpenCV-style HSV (0..180)
+                 */
+                if (hsv[0] >= 5 &&
+                        hsv[0] <= 22 &&
+                        hsv[1] >= 100 &&
+                        hsv[2] >= 80) {
+
+                    mask[y * w + x] = true;
                 }
             }
         }
 
-        if (count < 25) {
+        /*
+         * Use row density.  The face creates a much stronger orange cluster
+         * than bubbles or UI elements.
+         */
+        int bestY = -1;
+        int bestCount = 0;
+
+        for (int y = y0; y < y1; y += 4) {
+
+            int count = 0;
+
+            for (int x = x0; x < x1; x += 4) {
+                if (mask[y * w + x]) count++;
+            }
+
+            if (count > bestCount) {
+                bestCount = count;
+                bestY = y;
+            }
+        }
+
+        if (bestY < 0 || bestCount < 8) {
             return -1;
         }
 
-        return (int) (sumY / count);
+        /*
+         * Average nearby strong orange rows to reduce jitter.
+         */
+        int sum = 0;
+        int n = 0;
+
+        for (int y = Math.max(y0, bestY - 50);
+             y <= Math.min(y1 - 1, bestY + 50);
+             y += 2) {
+
+            int count = 0;
+
+            for (int x = x0; x < x1; x += 3) {
+                if (mask[y * w + x]) count++;
+            }
+
+            if (count >= Math.max(3, bestCount / 4)) {
+                sum += y;
+                n++;
+            }
+        }
+
+        return n > 0 ? sum / n : bestY;
     }
 
-    private void resetSteeringMemory() {
-        previousTargetX = -1;
-        previousGapWidth = -1;
-        previousCenterDistance = -1;
-        previousSteerDirection = 0;
-        previousSteerTime = 0;
+    private boolean[][] buildMasks(Bitmap b) {
+        int w = b.getWidth();
+        int h = b.getHeight();
+
+        boolean[] platform = new boolean[w * h];
+        boolean[] yellow = new boolean[w * h];
+
+        for (int y = 0; y < h; y += 2) {
+
+            for (int x = 0; x < w; x += 2) {
+
+                int c = b.getPixel(x, y);
+
+                int[] hsv = rgbToHsv(
+                        Color.red(c),
+                        Color.green(c),
+                        Color.blue(c)
+                );
+
+                boolean t =
+                        isTeal(
+                                hsv[0],
+                                hsv[1],
+                                hsv[2]
+                        );
+
+                boolean yel =
+                        isYellow(
+                                hsv[0],
+                                hsv[1],
+                                hsv[2]
+                        );
+
+                if (t || yel) {
+                    platform[y * w + x] = true;
+                }
+
+                if (yel) {
+                    yellow[y * w + x] = true;
+                }
+
+                /*
+                 * Fill the skipped pixel in a 2x2 block.  This avoids holes
+                 * caused by the sampling stride.
+                 */
+                if (x + 1 < w) {
+                    platform[y * w + x + 1] =
+                            platform[y * w + x];
+
+                    yellow[y * w + x + 1] =
+                            yellow[y * w + x];
+                }
+
+                if (y + 1 < h) {
+                    platform[(y + 1) * w + x] =
+                            platform[y * w + x];
+
+                    yellow[(y + 1) * w + x] =
+                            yellow[y * w + x];
+
+                    if (x + 1 < w) {
+                        platform[(y + 1) * w + x + 1] =
+                                platform[y * w + x];
+
+                        yellow[(y + 1) * w + x + 1] =
+                                yellow[y * w + x];
+                    }
+                }
+            }
+        }
+
+        return new boolean[][]{
+                platform,
+                yellow
+        };
     }
 
-    private boolean isTealPlatform(int hue, int sat, int val) {
-        return hue >= 82 && hue <= 112 && sat >= 70 && val >= 45;
+    private boolean isTeal(int hue, int sat, int val) {
+        return hue >= 80 &&
+                hue <= 115 &&
+                sat >= 65 &&
+                val >= 40;
     }
 
-    private boolean isYellowDanger(int hue, int sat, int val) {
-        return hue >= 18 && hue <= 48 && sat >= 115 && val >= 120;
+    private boolean isYellow(int hue, int sat, int val) {
+        return hue >= 18 &&
+                hue <= 50 &&
+                sat >= 105 &&
+                val >= 110;
     }
 
     private int[] rgbToHsv(int r, int g, int b) {
@@ -773,6 +943,7 @@ public class CaptureService extends Service {
         float delta = max - min;
 
         float hue;
+
         if (delta == 0) {
             hue = 0;
         } else if (max == rf) {
@@ -783,11 +954,10 @@ public class CaptureService extends Service {
             hue = 60f * (((rf - gf) / delta) + 4f);
         }
 
-        if (hue < 0) {
-            hue += 360f;
-        }
+        if (hue < 0) hue += 360f;
 
-        float saturation = max == 0 ? 0 : delta / max;
+        float saturation =
+                max == 0 ? 0 : delta / max;
 
         return new int[]{
                 Math.round(hue / 2f),
@@ -796,45 +966,23 @@ public class CaptureService extends Service {
         };
     }
 
-    private int clamp(int value, int min, int max) {
-        return Math.max(min, Math.min(max, value));
+    private void resetControlMemory() {
+        pendingSwipeSign = 0;
+        pendingBeforeScore = Float.NaN;
+        pendingSwipeAt = 0;
+        stableBoardFrames = 0;
     }
 
-    private static class PlatformLine {
-        final int y;
-        final int strength;
-        PlatformLine(int y, int strength) {
-            this.y = y;
-            this.strength = strength;
-        }
-    }
-
-    private static class Run {
-        final int start;
-        final int end;
-        Run(int start, int end) {
-            this.start = start;
-            this.end = end;
-        }
-    }
-
-    private static class Gap {
-        final int start;
-        final int end;
-        final int width;
-        final int center;
-
-        Gap(int start, int end, int width, int center) {
-            this.start = start;
-            this.end = end;
-            this.width = width;
-            this.center = center;
-        }
+    private int clamp(int v, int min, int max) {
+        return Math.max(min, Math.min(max, v));
     }
 
     private Notification buildNotification() {
-        return new Notification.Builder(this, "autoplayer")
-                .setContentTitle("Vluck Auto Player")
+        return new Notification.Builder(
+                this,
+                "autoplayer"
+        )
+                .setContentTitle("Vluck Auto Player V4")
                 .setContentText("Auto play is running")
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setOngoing(true)
@@ -843,11 +991,13 @@ public class CaptureService extends Service {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel channel = new NotificationChannel(
-                    "autoplayer",
-                    "Auto Player",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+            NotificationChannel channel =
+                    new NotificationChannel(
+                            "autoplayer",
+                            "Auto Player",
+                            NotificationManager.IMPORTANCE_LOW
+                    );
+
             getSystemService(NotificationManager.class)
                     .createNotificationChannel(channel);
         }
@@ -860,12 +1010,15 @@ public class CaptureService extends Service {
         if (virtualDisplay != null) {
             virtualDisplay.release();
         }
+
         if (imageReader != null) {
             imageReader.close();
         }
+
         if (projection != null) {
             projection.stop();
         }
+
         if (thread != null) {
             thread.quitSafely();
         }
@@ -876,5 +1029,31 @@ public class CaptureService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private static class Interval {
+        final int start;
+        final int end;
+
+        Interval(int start, int end) {
+            this.start = start;
+            this.end = end;
+        }
+    }
+
+    private static class PlayerAndPlan {
+        final int playerY;
+        final int bestTargetX;
+        final float dangerScore;
+
+        PlayerAndPlan(
+                int playerY,
+                int bestTargetX,
+                float dangerScore) {
+
+            this.playerY = playerY;
+            this.bestTargetX = bestTargetX;
+            this.dangerScore = dangerScore;
+        }
     }
 }

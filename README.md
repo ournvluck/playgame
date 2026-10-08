@@ -1,17 +1,18 @@
-# Vluck Auto Player V3
+# Vluck Auto Player V4
 
-This version changes the gameplay controller to match the observed game behaviour:
+Built around the supplied 78-second game recording.
 
-- The loading screen is ignored. The controller waits until real teal game platforms are visible.
-- The character is treated as the fixed reference point near the screen centre.
-- The controller finds the **first platform below the character**, rather than scanning arbitrary lower rows.
-- It treats both teal platform surface and yellow danger sections as **blocked**.
-- It searches for a real empty gap in that next platform.
-- If the centre is already inside a sufficiently wide safe gap, it does **nothing** and lets the character fall.
-- If the centre is not safe, it rotates the tower with a horizontal drag toward the nearest safe gap.
-- It uses feedback from the next frames to learn whether the game's drag direction is inverted and automatically reverses when necessary.
-- Victory → taps Continue.
-- Defeat → taps Restart.
-- The controller avoids steering during loading/transition frames.
+V4 changes:
+- Loading screen is ignored; the controller waits for the real game board.
+- Uses the orange face to track the falling character vertically.
+- Detects teal safe platforms and yellow danger areas.
+- Looks at up to five upcoming platforms instead of only the next platform.
+- Chooses a horizontal angle that avoids yellow across the deepest safe route visible.
+- Uses small feedback-controlled horizontal drags and automatically reverses the drag direction if a move makes the danger worse.
+- Does not move when the current route is already safe.
+- Victory: automatically taps Continue.
+- Defeat: automatically taps Restart.
+- Auto-start setup when the app is opened.
+- STOP button remains available.
 
-The first Android setup still requires user approval for Accessibility and screen capture permissions.
+Android still requires the user to approve Accessibility and screen-capture permissions. Android may show "Restricted setting" for a sideloaded Accessibility service; this is an Android security restriction and cannot be bypassed by the APK.
